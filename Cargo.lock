@@ -3543,6 +3543,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "spur-api"
+version = "0.6.0"
+dependencies = [
+ "prost-types",
+ "serde",
+ "serde_json",
+ "spur-core",
+ "spur-proto",
+]
+
+[[package]]
 name = "spur-cli"
 version = "0.6.0"
 dependencies = [
@@ -3556,8 +3567,10 @@ dependencies = [
  "prost-types",
  "serde",
  "serde_json",
+ "serde_yaml",
  "serial_test",
  "shlex",
+ "spur-api",
  "spur-client",
  "spur-core",
  "spur-net",
@@ -3789,6 +3802,7 @@ dependencies = [
  "prost-types",
  "serde",
  "serde_json",
+ "spur-api",
  "spur-core",
  "spur-metrics",
  "spur-net",
