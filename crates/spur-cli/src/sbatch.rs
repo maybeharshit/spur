@@ -1336,22 +1336,30 @@ echo "hello world"
         assert_eq!(args.job_name.as_deref(), Some("script-name"));
     }
 
+    // `parse_merged` resolves SBATCH_NODELIST from the environment, so these
+    // share the env_injection guard with the tests that inject it.
     #[test]
+    #[serial(env_injection)]
     fn test_nodefile_directive_is_parsed() {
+        let _env = EnvGuard::new();
         let args = parse_merged(&["--nodefile=nodes.txt"], &["sbatch"]);
         assert_eq!(args.nodefile.as_deref(), Some("nodes.txt"));
         assert!(args.nodelist.is_none());
     }
 
     #[test]
+    #[serial(env_injection)]
     fn test_cli_nodelist_overrides_nodefile_directive() {
+        let _env = EnvGuard::new();
         let args = parse_merged(&["--nodefile=nodes.txt"], &["sbatch", "--nodelist=node001"]);
         assert_eq!(args.nodelist.as_deref(), Some("node001"));
         assert!(args.nodefile.is_none());
     }
 
     #[test]
+    #[serial(env_injection)]
     fn test_cli_nodefile_overrides_nodelist_directive() {
+        let _env = EnvGuard::new();
         let args = parse_merged(&["--nodelist=node001"], &["sbatch", "-F", "nodes.txt"]);
         assert_eq!(args.nodefile.as_deref(), Some("nodes.txt"));
         assert!(args.nodelist.is_none());
