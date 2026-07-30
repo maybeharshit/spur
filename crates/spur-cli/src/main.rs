@@ -13,6 +13,7 @@ mod mock_controller;
 mod net;
 mod node;
 mod nodelist;
+mod output;
 mod sacct;
 mod sacctmgr;
 mod salloc;

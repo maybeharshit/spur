@@ -3,7 +3,10 @@
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
-use spur_proto::proto::GetJobRequest;
+use spur_api::{JobStatisticsPayload, JobStatisticsView};
+use spur_proto::proto::{GetJobRequest, JobInfo};
+
+use crate::output::{self, OutputArgs, OutputFormat};
 
 /// Display status information for running jobs.
 #[derive(Parser, Debug)]
@@ -25,6 +28,9 @@ pub struct SstatArgs {
     #[arg(short = 'p', long)]
     pub parsable: bool,
 
+    #[command(flatten)]
+    pub output: OutputArgs,
+
     /// Controller address
     #[arg(
         long,
@@ -38,8 +44,10 @@ pub async fn main() -> Result<()> {
     main_with_args(std::env::args().collect()).await
 }
 
-pub async fn main_with_args(args: Vec<String>) -> Result<()> {
-    let args = SstatArgs::try_parse_from(&args)?;
+pub async fn main_with_args(argv: Vec<String>) -> Result<()> {
+    let args = SstatArgs::try_parse_from(&argv)?;
+
+    let output_format = args.output.format()?;
 
     // Parse job IDs (comma-separated)
     let job_ids: Vec<u32> = args
@@ -57,29 +65,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         .context("failed to connect to spurctld")?;
     let mut client = spur_proto::controller_client(channel);
 
-    // Determine which fields to show
-    let fields = if let Some(ref fmt) = args.format {
-        parse_field_list(fmt)
-    } else {
-        default_fields()
-    };
-
-    let delimiter = if args.parsable { "|" } else { "  " };
-
-    // Print header
-    if !args.noheader {
-        let headers: Vec<String> = fields.iter().map(format_header).collect();
-        if args.parsable {
-            println!("{}|", headers.join(delimiter));
-        } else {
-            println!("{}", headers.join(delimiter));
-        }
-        if !args.parsable {
-            let sep: Vec<String> = fields.iter().map(|f| "-".repeat(field_width(f))).collect();
-            println!("{}", sep.join(delimiter));
-        }
-    }
-
+    let mut running = Vec::new();
     for job_id in &job_ids {
         let response = client
             .get_job(GetJobRequest { job_id: *job_id })
@@ -88,7 +74,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
 
         let job = response.into_inner();
 
-        // Only show running jobs
+        // sstat reports live usage, which only exists for running jobs.
         if job.state != spur_proto::proto::JobState::JobRunning as i32 {
             eprintln!(
                 "sstat: job {} is not running (state: {})",
@@ -98,21 +84,61 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
             continue;
         }
 
-        let values: Vec<String> = fields.iter().map(|f| resolve_field(&job, f)).collect();
-        if args.parsable {
-            println!("{}|", values.join(delimiter));
-        } else {
-            // Pad each value to field width
-            let padded: Vec<String> = fields
-                .iter()
-                .zip(values.iter())
-                .map(|(f, v)| format!("{:>width$}", v, width = field_width(f)))
-                .collect();
-            println!("{}", padded.join(delimiter));
-        }
+        running.push(job);
+    }
+
+    if let OutputFormat::Structured(encoding) = output_format {
+        return output::emit(
+            encoding,
+            &argv,
+            JobStatisticsPayload {
+                statistics: running.iter().map(JobStatisticsView::from).collect(),
+            },
+        );
+    }
+
+    for line in render_text(&args, &running) {
+        println!("{line}");
     }
 
     Ok(())
+}
+
+fn render_text(args: &SstatArgs, jobs: &[JobInfo]) -> Vec<String> {
+    let fields = match args.format {
+        Some(ref fmt) => parse_field_list(fmt),
+        None => default_fields(),
+    };
+    let delimiter = if args.parsable { "|" } else { "  " };
+
+    let mut lines = Vec::new();
+
+    if !args.noheader {
+        let headers: Vec<String> = fields.iter().map(format_header).collect();
+        if args.parsable {
+            lines.push(format!("{}|", headers.join(delimiter)));
+        } else {
+            lines.push(headers.join(delimiter));
+            let sep: Vec<String> = fields.iter().map(|f| "-".repeat(field_width(f))).collect();
+            lines.push(sep.join(delimiter));
+        }
+    }
+
+    for job in jobs {
+        let values: Vec<String> = fields.iter().map(|f| resolve_field(job, f)).collect();
+        if args.parsable {
+            lines.push(format!("{}|", values.join(delimiter)));
+            continue;
+        }
+        let padded: Vec<String> = fields
+            .iter()
+            .zip(values.iter())
+            .map(|(f, v)| format!("{:>width$}", v, width = field_width(f)))
+            .collect();
+        lines.push(padded.join(delimiter));
+    }
+
+    lines
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -256,5 +282,91 @@ fn format_duration(total_seconds: i64) -> String {
         format!("{}-{:02}:{:02}:{:02}", days, hours, minutes, seconds)
     } else {
         format!("{:02}:{:02}:{:02}", hours, minutes, seconds)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use spur_proto::proto::JobState;
+
+    fn running(job_id: u32) -> JobInfo {
+        JobInfo {
+            job_id,
+            state: JobState::JobRunning as i32,
+            num_tasks: 4,
+            cpus_per_task: 8,
+            nodelist: "node[01-02]".into(),
+            run_time: Some(prost_types::Duration {
+                seconds: 3661,
+                nanos: 0,
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn structured_output_flags_are_accepted() {
+        let args = SstatArgs::try_parse_from(["sstat", "-j", "1", "--json"]).unwrap();
+        assert_eq!(
+            args.output.format().unwrap(),
+            crate::output::OutputFormat::Structured(crate::output::Encoding::Json)
+        );
+
+        let args = SstatArgs::try_parse_from(["sstat", "-j", "1", "--yaml"]).unwrap();
+        assert_eq!(
+            args.output.format().unwrap(),
+            crate::output::OutputFormat::Structured(crate::output::Encoding::Yaml)
+        );
+    }
+
+    #[test]
+    fn json_document_carries_usage_under_a_statistics_key() {
+        let doc = crate::output::render(
+            crate::output::Encoding::Json,
+            &["sstat".to_string()],
+            JobStatisticsPayload {
+                statistics: vec![JobStatisticsView::from(&running(5))],
+            },
+        )
+        .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&doc).unwrap();
+        assert_eq!(parsed["statistics"][0]["job_id"], 5);
+        assert_eq!(parsed["statistics"][0]["cpus"], 32);
+        assert_eq!(parsed["statistics"][0]["elapsed"], 3661);
+    }
+
+    #[test]
+    fn text_rendering_emits_a_header_and_separator_above_the_rows() {
+        let args = SstatArgs::try_parse_from(["sstat", "-j", "5"]).unwrap();
+        let lines = render_text(&args, &[running(5)]);
+        assert_eq!(lines.len(), 3);
+        assert!(lines[0].contains("JobID"));
+        assert!(lines[1].contains("---"));
+        assert!(lines[2].contains('5'));
+    }
+
+    #[test]
+    fn parsable_output_uses_pipes_and_omits_the_separator() {
+        let args = SstatArgs::try_parse_from(["sstat", "-j", "5", "-p"]).unwrap();
+        let lines = render_text(&args, &[running(5)]);
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].ends_with('|'));
+        assert!(lines[1].contains("node[01-02]|"));
+    }
+
+    #[test]
+    fn noheader_drops_the_header_and_its_separator() {
+        let args = SstatArgs::try_parse_from(["sstat", "-j", "5", "--noheader"]).unwrap();
+        let lines = render_text(&args, &[running(5)]);
+        assert_eq!(lines.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn non_numeric_job_ids_fail_before_connecting() {
+        let err = main_with_args(vec!["sstat".into(), "-j".into(), "abc".into()])
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("no valid job IDs"));
     }
 }

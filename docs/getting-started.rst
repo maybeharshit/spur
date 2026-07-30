@@ -98,6 +98,56 @@ Or create symlinks for full drop-in compatibility:
        ln -sf spur $cmd
    done
 
+Machine-Readable Output
+-----------------------
+
+Every query command accepts ``--json`` and ``--yaml`` instead of parsing
+fixed-width text:
+
+.. code-block:: bash
+
+   squeue --json
+   sinfo --yaml
+   sacct --json
+   sprio --json
+   sstat -j 42 --json
+   sdiag --json
+   scontrol show nodes --json
+
+The flags are supported by ``squeue``, ``sinfo``, ``sacct``, ``sprio``,
+``sstat``, ``sdiag``, and ``scontrol show``. Documents use the same envelope
+as the REST API — a ``meta`` block followed by the entity array — so a script
+can consume either surface:
+
+.. code-block:: json
+
+   {
+     "meta": {
+       "Slurm": { "version": { "major": 0, "minor": 0, "micro": 42 }, "release": "spur 0.6.0" },
+       "command": ["squeue", "--json"]
+     },
+     "jobs": [
+       { "job_id": 42, "name": "train", "job_state": "RUNNING", "partition": "gpu" }
+     ]
+   }
+
+Field values are typed rather than pre-formatted: timestamps are epoch
+seconds, time limits are minutes (``null`` when unlimited), and durations are
+seconds. This means no reparsing of strings like ``1-04:33:12``.
+
+.. code-block:: bash
+
+   # Count pending jobs
+   squeue -t PD --json | jq '.jobs | length'
+
+   # Nodes with a GPU allocated
+   sinfo --json | jq -r '.nodes[] | select(.gpus | length > 0) | .name'
+
+Slurm spells these flags ``--json[=<parser>]``; the explicit form is accepted
+for compatibility, and Spur publishes the single schema version reported in
+``meta``. Text-formatting flags such as ``-o`` and ``-l`` are ignored when a
+structured format is selected.
+
 Requesting GPUs
 ---------------
 

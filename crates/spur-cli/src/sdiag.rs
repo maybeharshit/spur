@@ -3,9 +3,16 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use spur_api::diag::{
+    active_jobs, finished_jobs, job_count, node_count, rpc_statistics, success_rate,
+    DiagnosticsView, ServerView,
+};
+use spur_api::DiagnosticsPayload;
 use spur_core::job::JobState as CoreJobState;
 use spur_core::node::NodeState as CoreNodeState;
-use spur_proto::proto::{JobMetrics, NodeMetrics, RpcOperationStats, RpcStats, SchedStats};
+use spur_proto::proto::{JobMetrics, NodeMetrics, PingResponse, RpcStats, SchedStats};
+
+use crate::output::{self, OutputArgs, OutputFormat};
 
 /// Display scheduler diagnostics and statistics.
 #[derive(Parser, Debug)]
@@ -18,6 +25,9 @@ pub struct SdiagArgs {
     /// Reset accumulated statistics counters on the controller
     #[arg(long)]
     pub reset: bool,
+
+    #[command(flatten)]
+    pub output: OutputArgs,
 
     /// Controller address
     #[arg(
@@ -32,8 +42,10 @@ pub async fn main() -> Result<()> {
     main_with_args(std::env::args().collect()).await
 }
 
-pub async fn main_with_args(args: Vec<String>) -> Result<()> {
-    let args = SdiagArgs::try_parse_from(&args)?;
+pub async fn main_with_args(argv: Vec<String>) -> Result<()> {
+    let args = SdiagArgs::try_parse_from(&argv)?;
+
+    let format = args.output.format()?;
 
     let channel = spur_client::connect_channel(&args.controller)
         .await
@@ -74,6 +86,44 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         .context("failed to get scheduler statistics")?
         .into_inner();
 
+    if let OutputFormat::Structured(encoding) = format {
+        return output::emit(
+            encoding,
+            &argv,
+            DiagnosticsPayload {
+                statistics: DiagnosticsView {
+                    server: ServerView::from(&ping),
+                    jobs: (&job_metrics).into(),
+                    nodes: (&node_metrics).into(),
+                    scheduler: (&sched_stats).into(),
+                    rpcs: rpc_statistics(&rpc_stats),
+                },
+            },
+        );
+    }
+
+    for line in render_text(
+        &args,
+        &ping,
+        &job_metrics,
+        &node_metrics,
+        &sched_stats,
+        &rpc_stats,
+    ) {
+        println!("{line}");
+    }
+
+    Ok(())
+}
+
+fn render_text(
+    args: &SdiagArgs,
+    ping: &PingResponse,
+    job_metrics: &JobMetrics,
+    node_metrics: &NodeMetrics,
+    sched_stats: &SchedStats,
+    rpc_stats: &RpcStats,
+) -> Vec<String> {
     let server_time = ping
         .server_time
         .as_ref()
@@ -85,48 +135,32 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         })
         .unwrap_or_else(|| "N/A".into());
 
+    let mut lines = Vec::new();
+
     if !args.noheader {
-        println!("***********************************************");
-        println!("sdiag output at {}", server_time);
-        println!("***********************************************");
-        println!();
+        lines.push("***********************************************".to_string());
+        lines.push(format!("sdiag output at {}", server_time));
+        lines.push("***********************************************".to_string());
+        lines.push(String::new());
     }
 
-    println!("Server Information:");
-    println!("  Hostname          : {}", ping.hostname);
-    println!("  Version           : {}", ping.version);
-    println!("  Server Time       : {}", server_time);
+    lines.push("Server Information:".to_string());
+    lines.push(format!("  Hostname          : {}", ping.hostname));
+    lines.push(format!("  Version           : {}", ping.version));
+    lines.push(format!("  Server Time       : {}", server_time));
 
     if !ping.federation_peers.is_empty() {
-        println!("  Federation Peers  : {}", ping.federation_peers.join(", "));
+        lines.push(format!(
+            "  Federation Peers  : {}",
+            ping.federation_peers.join(", ")
+        ));
     }
 
-    print_job_statistics(&job_metrics);
-    print_node_statistics(&node_metrics);
-    print_scheduler_statistics(&sched_stats);
-    print_rpc_statistics(&rpc_stats);
-
-    Ok(())
-}
-
-fn job_count(metrics: &JobMetrics, state: CoreJobState) -> u64 {
-    let wire = state.to_proto_i32();
-    metrics
-        .by_state
-        .iter()
-        .find(|e| e.state == wire)
-        .map(|e| e.count)
-        .unwrap_or(0)
-}
-
-fn node_count(metrics: &NodeMetrics, state: CoreNodeState) -> u64 {
-    let wire = state.to_proto_i32();
-    metrics
-        .by_state
-        .iter()
-        .find(|e| e.state == wire)
-        .map(|e| e.count)
-        .unwrap_or(0)
+    lines.extend(job_statistics_lines(job_metrics));
+    lines.extend(node_statistics_lines(node_metrics));
+    lines.extend(scheduler_statistics_lines(sched_stats));
+    lines.extend(rpc_statistics_lines(rpc_stats));
+    lines
 }
 
 fn format_bytes(bytes: u64) -> String {
@@ -145,76 +179,74 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
-fn print_job_statistics(metrics: &JobMetrics) {
-    println!();
-    println!("Job Statistics:");
-    println!("  Total Jobs        : {}", metrics.total);
+fn job_statistics_lines(metrics: &JobMetrics) -> Vec<String> {
+    let mut lines = vec![
+        String::new(),
+        "Job Statistics:".to_string(),
+        format!("  Total Jobs        : {}", metrics.total),
+    ];
 
     for &state in &CoreJobState::ALL {
-        let count = job_count(metrics, state);
-        println!("  {:18}: {}", state.display(), count);
+        lines.push(format!(
+            "  {:18}: {}",
+            state.display(),
+            job_count(metrics, state)
+        ));
     }
 
     if metrics.held_pending > 0 {
-        println!("  Held (pending)    : {}", metrics.held_pending);
+        lines.push(format!("  Held (pending)    : {}", metrics.held_pending));
     }
 
-    println!("  CPUs Allocated    : {}", metrics.running_cpus);
-    println!(
+    lines.push(format!("  CPUs Allocated    : {}", metrics.running_cpus));
+    lines.push(format!(
         "  Memory Allocated  : {}",
         format_bytes(metrics.running_memory_bytes)
-    );
-    println!("  GPUs Allocated    : {}", metrics.running_gpus);
+    ));
+    lines.push(format!("  GPUs Allocated    : {}", metrics.running_gpus));
 
-    let completed = job_count(metrics, CoreJobState::Completed);
-    let finished: u64 = CoreJobState::ALL
-        .iter()
-        .filter(|s| s.is_terminal())
-        .map(|s| job_count(metrics, *s))
-        .sum();
-    let success_rate = if finished > 0 {
-        (completed as f64 / finished as f64) * 100.0
-    } else {
-        0.0
-    };
-    let active: u64 = CoreJobState::ALL
-        .iter()
-        .filter(|s| s.is_active())
-        .map(|s| job_count(metrics, *s))
-        .sum();
-
-    println!();
-    println!("Derived Statistics:");
-    println!("  Finished Jobs     : {}", finished);
-    println!("  Success Rate      : {:.1}%", success_rate);
-    println!(
+    lines.push(String::new());
+    lines.push("Derived Statistics:".to_string());
+    lines.push(format!("  Finished Jobs     : {}", finished_jobs(metrics)));
+    lines.push(format!(
+        "  Success Rate      : {:.1}%",
+        success_rate(metrics)
+    ));
+    lines.push(format!(
         "  Active Jobs       : {} (running + completing + suspended)",
-        active
-    );
+        active_jobs(metrics)
+    ));
+    lines
 }
 
-fn print_node_statistics(metrics: &NodeMetrics) {
-    println!();
-    println!("Node Statistics:");
-    println!("  Total Nodes       : {}", metrics.total);
+fn node_statistics_lines(metrics: &NodeMetrics) -> Vec<String> {
+    let mut lines = vec![
+        String::new(),
+        "Node Statistics:".to_string(),
+        format!("  Total Nodes       : {}", metrics.total),
+    ];
 
     for &state in &CoreNodeState::ALL {
-        let count = node_count(metrics, state);
-        println!("  {:18}: {}", state.display_upper(), count);
+        lines.push(format!(
+            "  {:18}: {}",
+            state.display_upper(),
+            node_count(metrics, state)
+        ));
     }
 
-    println!("  Total CPUs        : {}", metrics.total_cpus);
-    println!("  Allocated CPUs    : {}", metrics.alloc_cpus);
-    println!(
+    lines.push(format!("  Total CPUs        : {}", metrics.total_cpus));
+    lines.push(format!("  Allocated CPUs    : {}", metrics.alloc_cpus));
+    lines.push(format!(
         "  Total Memory      : {}",
         format_bytes(metrics.total_memory_bytes)
-    );
-    println!(
+    ));
+    lines.push(format!(
         "  Allocated Memory  : {}",
         format_bytes(metrics.alloc_memory_bytes)
-    );
-    println!("  Total GPUs        : {}", metrics.total_gpus);
-    println!("  Allocated GPUs    : {}", metrics.alloc_gpus);
+    ));
+    lines.push(format!("  Total GPUs        : {}", metrics.total_gpus));
+    lines.push(format!("  Allocated GPUs    : {}", metrics.alloc_gpus));
+    lines
 }
 
 fn scheduler_statistics_lines(stats: &SchedStats) -> Vec<String> {
@@ -238,69 +270,97 @@ fn scheduler_statistics_lines(stats: &SchedStats) -> Vec<String> {
     ]
 }
 
-fn print_scheduler_statistics(stats: &SchedStats) {
-    for line in scheduler_statistics_lines(stats) {
-        println!("{line}");
-    }
-}
-
 fn rpc_statistics_lines(stats: &RpcStats) -> Vec<String> {
     let mut lines = vec![
         String::new(),
         "Remote Procedure Call statistics by operation:".to_string(),
     ];
 
-    if stats.by_operation.is_empty() {
+    let ops = rpc_statistics(stats);
+    if ops.is_empty() {
         lines.push("  (no RPC calls recorded)".to_string());
         return lines;
     }
 
-    let mut ops: Vec<&RpcOperationStats> = stats.by_operation.iter().collect();
-    ops.sort_by_key(|b| std::cmp::Reverse(b.total_time_us));
-
-    for op in ops {
-        lines.push(format!(
+    lines.extend(ops.iter().map(|op| {
+        format!(
             "  {:24} count:{:8}  ave_time_us:{:8}  total_time_us:{}",
-            op.operation, op.count, op.avg_time_us, op.total_time_us
-        ));
-    }
-
+            op.operation, op.count, op.average_time_us, op.total_time_us
+        )
+    }));
     lines
-}
-
-fn print_rpc_statistics(stats: &RpcStats) {
-    for line in rpc_statistics_lines(stats) {
-        println!("{line}");
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use spur_proto::proto::JobState;
+    use spur_proto::proto::{JobState, JobStateCount, RpcOperationStats};
 
     #[test]
-    fn job_count_reads_proto_entries() {
-        let metrics = JobMetrics {
-            total: 2,
-            by_state: vec![
-                spur_proto::proto::JobStateCount {
-                    state: JobState::JobPending as i32,
-                    count: 1,
-                },
-                spur_proto::proto::JobStateCount {
-                    state: JobState::JobRunning as i32,
-                    count: 1,
-                },
-            ],
-            held_pending: 0,
-            running_cpus: 4,
-            running_memory_bytes: 0,
-            running_gpus: 0,
+    fn structured_output_flags_are_accepted() {
+        let args = SdiagArgs::try_parse_from(["sdiag", "--json"]).unwrap();
+        assert_eq!(
+            args.output.format().unwrap(),
+            crate::output::OutputFormat::Structured(crate::output::Encoding::Json)
+        );
+
+        let args = SdiagArgs::try_parse_from(["sdiag", "--yaml"]).unwrap();
+        assert_eq!(
+            args.output.format().unwrap(),
+            crate::output::OutputFormat::Structured(crate::output::Encoding::Yaml)
+        );
+    }
+
+    #[test]
+    fn json_document_nests_every_section_under_statistics() {
+        let view = DiagnosticsView {
+            server: ServerView::from(&PingResponse {
+                hostname: "ctld01".into(),
+                version: "0.6.0".into(),
+                ..Default::default()
+            }),
+            jobs: (&JobMetrics::default()).into(),
+            nodes: (&NodeMetrics::default()).into(),
+            scheduler: (&SchedStats {
+                plugin: "backfill".into(),
+                cycles: 5,
+                ..Default::default()
+            })
+                .into(),
+            rpcs: rpc_statistics(&RpcStats::default()),
         };
-        assert_eq!(job_count(&metrics, CoreJobState::Pending), 1);
-        assert_eq!(job_count(&metrics, CoreJobState::Running), 1);
-        assert_eq!(job_count(&metrics, CoreJobState::OutOfMemory), 0);
+        let doc = crate::output::render(
+            crate::output::Encoding::Json,
+            &["sdiag".to_string()],
+            DiagnosticsPayload { statistics: view },
+        )
+        .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&doc).unwrap();
+        assert_eq!(parsed["statistics"]["server"]["hostname"], "ctld01");
+        assert_eq!(parsed["statistics"]["scheduler"]["plugin"], "backfill");
+        assert_eq!(parsed["statistics"]["scheduler"]["cycles"], 5);
+        assert_eq!(parsed["statistics"]["rpcs"], serde_json::json!([]));
+        assert!(parsed["statistics"]["jobs"]["by_state"].is_object());
+    }
+
+    #[test]
+    fn text_rendering_includes_the_banner_unless_suppressed() {
+        let ping = PingResponse {
+            hostname: "ctld01".into(),
+            ..Default::default()
+        };
+        let render = |argv: &[&str]| {
+            render_text(
+                &SdiagArgs::try_parse_from(argv).unwrap(),
+                &ping,
+                &JobMetrics::default(),
+                &NodeMetrics::default(),
+                &SchedStats::default(),
+                &RpcStats::default(),
+            )
+        };
+        assert!(render(&["sdiag"])[0].starts_with("****"));
+        assert_eq!(render(&["sdiag", "--noheader"])[0], "Server Information:");
     }
 
     #[test]
@@ -312,50 +372,45 @@ mod tests {
     }
 
     #[test]
-    fn derived_job_totals_use_terminal_and_active_flags() {
+    fn job_statistics_lines_report_every_state_and_the_derived_totals() {
         let metrics = JobMetrics {
-            total: 6,
+            total: 3,
             by_state: vec![
-                spur_proto::proto::JobStateCount {
-                    state: JobState::JobPending as i32,
-                    count: 1,
-                },
-                spur_proto::proto::JobStateCount {
+                JobStateCount {
                     state: JobState::JobRunning as i32,
                     count: 1,
                 },
-                spur_proto::proto::JobStateCount {
-                    state: JobState::JobSuspended as i32,
-                    count: 1,
-                },
-                spur_proto::proto::JobStateCount {
-                    state: JobState::JobNodeFail as i32,
-                    count: 1,
-                },
-                spur_proto::proto::JobStateCount {
+                JobStateCount {
                     state: JobState::JobCompleted as i32,
                     count: 2,
                 },
             ],
-            held_pending: 0,
-            running_cpus: 0,
-            running_memory_bytes: 0,
-            running_gpus: 0,
+            ..Default::default()
         };
-
-        let finished: u64 = CoreJobState::ALL
+        let lines = job_statistics_lines(&metrics);
+        assert!(lines
             .iter()
-            .filter(|s| s.is_terminal())
-            .map(|s| job_count(&metrics, *s))
-            .sum();
-        let active: u64 = CoreJobState::ALL
+            .any(|l| l.contains("RUNNING") && l.ends_with('1')));
+        assert!(lines.iter().any(|l| l.contains("Finished Jobs     : 2")));
+        assert!(lines
             .iter()
-            .filter(|s| s.is_active())
-            .map(|s| job_count(&metrics, *s))
-            .sum();
+            .any(|l| l.contains("Success Rate      : 100.0%")));
+        assert!(lines.iter().any(|l| l.contains("Active Jobs       : 1")));
+    }
 
-        assert_eq!(finished, 3); // NODE_FAIL + 2 COMPLETED
-        assert_eq!(active, 2); // RUNNING + SUSPENDED
+    #[test]
+    fn node_statistics_lines_report_capacity_and_allocation() {
+        let metrics = NodeMetrics {
+            total: 2,
+            total_cpus: 256,
+            alloc_cpus: 64,
+            ..Default::default()
+        };
+        let lines = node_statistics_lines(&metrics);
+        assert!(lines.iter().any(|l| l.contains("Total Nodes       : 2")));
+        assert!(lines.iter().any(|l| l.contains("Total CPUs        : 256")));
+        assert!(lines.iter().any(|l| l.contains("Allocated CPUs    : 64")));
+        assert!(lines.iter().any(|l| l.contains("IDLE")));
     }
 
     #[test]

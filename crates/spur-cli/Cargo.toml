@@ -13,6 +13,7 @@ path = "src/main.rs"
 spur-proto = { path = "../spur-proto" }
 spur-client = { path = "../spur-client" }
 spur-core = { path = "../spur-core" }
+spur-api = { path = "../spur-api" }
 spur-update = { path = "../spur-update" }
 spur-net = { path = "../spur-net" }
 clap = { workspace = true }
@@ -20,6 +21,7 @@ tonic = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_yaml = { workspace = true }
 chrono = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }

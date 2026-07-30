@@ -4,8 +4,13 @@
 use std::collections::HashMap;
 
 use crate::exit_fmt::{format_exit, render_reason};
+use crate::output::{self, OutputArgs, OutputFormat};
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
+use spur_api::{
+    job::step_id_label, ClusterConfigView, ConfigPayload, FederationPayload, FederationPeerView,
+    JobsPayload, NodesPayload, PartitionsPayload, ReservationsPayload, StepsPayload,
+};
 
 /// Administrative control commands.
 #[derive(Parser, Debug)]
@@ -32,6 +37,8 @@ pub enum ScontrolCommand {
         entity: String,
         /// Entity name or ID
         name: Option<String>,
+        #[command(flatten)]
+        output: OutputArgs,
     },
     /// Update job/node/partition properties
     Update {
@@ -133,12 +140,17 @@ pub async fn main() -> Result<()> {
     main_with_args(std::env::args().collect()).await
 }
 
-pub async fn main_with_args(args: Vec<String>) -> Result<()> {
-    let args = ScontrolArgs::try_parse_from(&args)?;
+pub async fn main_with_args(argv: Vec<String>) -> Result<()> {
+    let args = ScontrolArgs::try_parse_from(&argv)?;
 
     match args.command {
-        ScontrolCommand::Show { entity, name } => {
-            show(&args.controller, &entity, name.as_deref()).await
+        ScontrolCommand::Show {
+            entity,
+            name,
+            output,
+        } => {
+            let format = output.format()?;
+            show(&args.controller, &entity, name.as_deref(), format, &argv).await
         }
         ScontrolCommand::Ping => ping(&args.controller).await,
         ScontrolCommand::Version => {
@@ -279,11 +291,22 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     }
 }
 
-async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> {
+async fn show(
+    controller: &str,
+    entity: &str,
+    name: Option<&str>,
+    format: OutputFormat,
+    argv: &[String],
+) -> Result<()> {
     let channel = spur_client::connect_channel(controller)
         .await
         .context("failed to connect to spurctld")?;
     let mut client = spur_proto::controller_client(channel);
+
+    let structured = match format {
+        OutputFormat::Structured(encoding) => Some(encoding),
+        OutputFormat::Text => None,
+    };
 
     match entity.to_lowercase().as_str() {
         "job" | "jobs" => {
@@ -299,7 +322,12 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
                 .await
                 .context("failed to get jobs")?;
 
-            for job in resp.into_inner().jobs {
+            let jobs = resp.into_inner().jobs;
+            if let Some(encoding) = structured {
+                return output::emit(encoding, argv, JobsPayload::from_proto(&jobs));
+            }
+
+            for job in jobs {
                 println!("JobId={} JobName={}", job.job_id, job.name);
                 if !job.comment.is_empty() {
                     println!("   Comment={}", job.comment);
@@ -357,7 +385,12 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
                 .await
                 .context("failed to get nodes")?;
 
-            for node in resp.into_inner().nodes {
+            let nodes = resp.into_inner().nodes;
+            if let Some(encoding) = structured {
+                return output::emit(encoding, argv, NodesPayload::from_proto(&nodes));
+            }
+
+            for node in nodes {
                 let total = node.total_resources.as_ref();
                 let alloc = node.alloc_resources.as_ref();
                 println!("NodeName={}", node.name);
@@ -411,7 +444,12 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
                 .await
                 .context("failed to get partitions")?;
 
-            for part in resp.into_inner().partitions {
+            let partitions = resp.into_inner().partitions;
+            if let Some(encoding) = structured {
+                return output::emit(encoding, argv, PartitionsPayload::from_proto(&partitions));
+            }
+
+            for part in partitions {
                 println!(
                     "PartitionName={}{}",
                     part.name,
@@ -450,7 +488,16 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
                 .await
                 .context("failed to list reservations")?;
 
-            for res in resp.into_inner().reservations {
+            let reservations = resp.into_inner().reservations;
+            if let Some(encoding) = structured {
+                return output::emit(
+                    encoding,
+                    argv,
+                    ReservationsPayload::from_proto(&reservations),
+                );
+            }
+
+            for res in reservations {
                 println!("ReservationName={}", res.name);
                 println!("   StartTime={}", res.start_time);
                 println!("   EndTime={}", res.end_time);
@@ -485,25 +532,40 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
                 .context("failed to get job steps")?;
 
             let steps = resp.into_inner().steps;
+            if let Some(encoding) = structured {
+                return output::emit(encoding, argv, StepsPayload::from_proto(&steps));
+            }
+
             if steps.is_empty() {
                 println!("No steps found for job {}", job_id);
             } else {
                 for step in steps {
-                    let step_name = if step.step_id == 0xFFFF_FFFE {
-                        "batch".to_string()
-                    } else if step.step_id == 0xFFFF_FFFD {
-                        "extern".to_string()
-                    } else {
-                        step.step_id.to_string()
-                    };
                     println!(
                         "StepId={}.{} StepName={} State={} NumTasks={}",
-                        step.job_id, step_name, step.name, step.state, step.num_tasks
+                        step.job_id,
+                        step_id_label(step.step_id),
+                        step.name,
+                        step.state,
+                        step.num_tasks
                     );
                 }
             }
         }
         "config" => {
+            if let Some(encoding) = structured {
+                return output::emit(
+                    encoding,
+                    argv,
+                    ConfigPayload {
+                        config: ClusterConfigView {
+                            cluster_name: "spur".into(),
+                            controller_address: controller.into(),
+                            version: env!("CARGO_PKG_VERSION").into(),
+                        },
+                    },
+                );
+            }
+
             println!("ClusterName=spur");
             println!("SlurmctldAddr={}", controller);
             println!("Version={}", env!("CARGO_PKG_VERSION"));
@@ -512,17 +574,31 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
             let resp = client.ping(()).await.context("failed to ping controller")?;
 
             let inner = resp.into_inner();
+            if let Some(encoding) = structured {
+                return output::emit(
+                    encoding,
+                    argv,
+                    FederationPayload {
+                        federation: inner
+                            .federation_peers
+                            .iter()
+                            .map(|p| FederationPeerView::parse(p))
+                            .collect(),
+                    },
+                );
+            }
+
             if inner.federation_peers.is_empty() {
                 println!("No federation peers configured.");
             } else {
                 println!("FEDERATION PEERS");
                 println!("{:<20} ADDRESS", "CLUSTER");
                 for peer in &inner.federation_peers {
-                    // Format is "name@address"
-                    if let Some((name, addr)) = peer.split_once('@') {
-                        println!("{:<20} {}", name, addr);
+                    let view = FederationPeerView::parse(peer);
+                    if view.address.is_empty() {
+                        println!("{:<20} (unknown)", view.cluster);
                     } else {
-                        println!("{:<20} (unknown)", peer);
+                        println!("{:<20} {}", view.cluster, view.address);
                     }
                 }
             }
@@ -790,6 +866,7 @@ fn gpu_tres_label(detail: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::output::Encoding;
 
     #[test]
     fn gpu_tres_label_per_node() {
@@ -807,5 +884,79 @@ mod tests {
     fn gpu_tres_label_total() {
         assert_eq!(gpu_tres_label("gpu:8"), "TresPerJob");
         assert_eq!(gpu_tres_label("gpu:mi300x:4"), "TresPerJob");
+    }
+
+    fn show_format(argv: &[&str]) -> OutputFormat {
+        let args = ScontrolArgs::try_parse_from(argv).unwrap();
+        match args.command {
+            ScontrolCommand::Show { output, .. } => output.format().unwrap(),
+            other => panic!("expected a show subcommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn show_accepts_structured_output_flags() {
+        assert_eq!(
+            show_format(&["scontrol", "show", "job", "--json"]),
+            OutputFormat::Structured(Encoding::Json)
+        );
+        assert_eq!(
+            show_format(&["scontrol", "show", "nodes", "--yaml"]),
+            OutputFormat::Structured(Encoding::Yaml)
+        );
+        assert_eq!(
+            show_format(&["scontrol", "show", "config"]),
+            OutputFormat::Text
+        );
+    }
+
+    #[test]
+    fn show_flags_survive_a_named_entity() {
+        assert_eq!(
+            show_format(&["scontrol", "show", "job", "42", "--json"]),
+            OutputFormat::Structured(Encoding::Json)
+        );
+    }
+
+    #[test]
+    fn config_document_reports_the_cluster_and_controller() {
+        let doc = output::render(
+            Encoding::Json,
+            &["scontrol".to_string()],
+            ConfigPayload {
+                config: ClusterConfigView {
+                    cluster_name: "spur".into(),
+                    controller_address: "http://localhost:6817".into(),
+                    version: env!("CARGO_PKG_VERSION").into(),
+                },
+            },
+        )
+        .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&doc).unwrap();
+        assert_eq!(parsed["config"]["cluster_name"], "spur");
+        assert_eq!(
+            parsed["config"]["controller_address"],
+            "http://localhost:6817"
+        );
+    }
+
+    #[test]
+    fn federation_document_splits_peers_into_cluster_and_address() {
+        let doc = output::render(
+            Encoding::Json,
+            &["scontrol".to_string()],
+            FederationPayload {
+                federation: ["west@10.0.0.1:6817", "east"]
+                    .iter()
+                    .map(|p| FederationPeerView::parse(p))
+                    .collect(),
+            },
+        )
+        .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&doc).unwrap();
+        assert_eq!(parsed["federation"][0]["cluster"], "west");
+        assert_eq!(parsed["federation"][0]["address"], "10.0.0.1:6817");
+        assert_eq!(parsed["federation"][1]["cluster"], "east");
+        assert_eq!(parsed["federation"][1]["address"], "");
     }
 }

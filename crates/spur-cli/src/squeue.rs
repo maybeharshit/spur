@@ -3,9 +3,11 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use spur_api::JobsPayload;
 use spur_proto::proto::GetJobsRequest;
 
 use crate::format_engine;
+use crate::output::{self, OutputArgs, OutputFormat};
 
 /// View information about jobs in the scheduling queue.
 #[derive(Parser, Debug)]
@@ -61,6 +63,9 @@ pub struct SqueueArgs {
     #[arg(short = 'S', long, allow_hyphen_values = true)]
     pub sort: Option<String>,
 
+    #[command(flatten)]
+    pub output: OutputArgs,
+
     /// Controller address
     #[arg(
         long,
@@ -74,28 +79,19 @@ pub async fn main() -> Result<()> {
     main_with_args(std::env::args().collect()).await
 }
 
-pub async fn main_with_args(args: Vec<String>) -> Result<()> {
-    let args = SqueueArgs::try_parse_from(&args)?;
+pub async fn main_with_args(argv: Vec<String>) -> Result<()> {
+    let args = SqueueArgs::try_parse_from(&argv)?;
 
-    // Determine format
-    let fmt = if let Some(ref f) = args.format {
-        f.clone()
-    } else if args.long {
-        "%.18i %.9P %.8j %.8u %.8T %.10M %.9l %.6D %R".to_string()
-    } else {
-        format_engine::SQUEUE_DEFAULT_FORMAT.to_string()
-    };
+    // Everything that can fail locally is validated before any network I/O, so a
+    // bad flag surfaces its own error rather than a downstream connect failure.
+    let format = args.output.format()?;
 
-    let fields = format_engine::parse_format(&fmt, &format_engine::squeue_header);
-
-    // Parse state filter — default to Pending+Running+Completing when no filter specified (Slurm default)
+    // Default to Pending+Running+Suspended+Completing when no filter specified (Slurm default)
     let states = match args.states.as_deref() {
         Some(s) => parse_states_arg(s)?,
         None => default_squeue_states(),
     };
 
-    // Parse the sort spec before any network I/O so an invalid -S surfaces its own error
-    // rather than a downstream connect failure.
     let sort_keys = match args.sort.as_deref() {
         Some(s) => parse_sort_arg(s)?,
         None => default_sort_keys(),
@@ -121,11 +117,11 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     let response = client
         .get_jobs(GetJobsRequest {
             states: states.iter().map(|s| *s as i32).collect(),
-            user: args.user.unwrap_or_default(),
-            partition: args.partition.unwrap_or_default(),
-            account: args.account.unwrap_or_default(),
+            user: args.user.clone().unwrap_or_default(),
+            partition: args.partition.clone().unwrap_or_default(),
+            account: args.account.clone().unwrap_or_default(),
             job_ids,
-            name: args.name.unwrap_or_default(),
+            name: args.name.clone().unwrap_or_default(),
         })
         .await
         .context("failed to get jobs")?;
@@ -133,18 +129,37 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     let mut jobs = response.into_inner().jobs;
     sort_jobs(&mut jobs, &sort_keys);
 
-    // Print header
-    if !args.noheader {
-        println!("{}", format_engine::format_header(&fields));
+    if let OutputFormat::Structured(encoding) = format {
+        return output::emit(encoding, &argv, JobsPayload::from_proto(&jobs));
     }
 
-    // Print rows
-    for job in &jobs {
-        let row = format_engine::format_row(&fields, &|spec| resolve_job_field(job, spec));
-        println!("{}", row);
+    for line in render_text(&args, &jobs) {
+        println!("{line}");
     }
 
     Ok(())
+}
+
+/// The column header (unless suppressed) followed by one line per job.
+fn render_text(args: &SqueueArgs, jobs: &[spur_proto::proto::JobInfo]) -> Vec<String> {
+    let fmt = if let Some(ref f) = args.format {
+        f.clone()
+    } else if args.long {
+        "%.18i %.9P %.8j %.8u %.8T %.10M %.9l %.6D %R".to_string()
+    } else {
+        format_engine::SQUEUE_DEFAULT_FORMAT.to_string()
+    };
+    let fields = format_engine::parse_format(&fmt, &format_engine::squeue_header);
+
+    let mut lines = Vec::new();
+    if !args.noheader {
+        lines.push(format_engine::format_header(&fields));
+    }
+    lines.extend(
+        jobs.iter()
+            .map(|job| format_engine::format_row(&fields, &|spec| resolve_job_field(job, spec))),
+    );
+    lines
 }
 
 fn resolve_job_field(job: &spur_proto::proto::JobInfo, spec: char) -> String {
@@ -416,6 +431,81 @@ fn format_timestamp(ts: Option<&prost_types::Timestamp>) -> String {
 mod tests {
     use super::*;
     use spur_proto::proto::JobState as P;
+
+    #[test]
+    fn structured_output_flags_are_accepted() {
+        let args = SqueueArgs::try_parse_from(["squeue", "--json"]).unwrap();
+        assert_eq!(
+            args.output.format().unwrap(),
+            crate::output::OutputFormat::Structured(crate::output::Encoding::Json)
+        );
+
+        let args = SqueueArgs::try_parse_from(["squeue", "--yaml"]).unwrap();
+        assert_eq!(
+            args.output.format().unwrap(),
+            crate::output::OutputFormat::Structured(crate::output::Encoding::Yaml)
+        );
+    }
+
+    #[test]
+    fn text_formatting_flags_coexist_with_json() {
+        // Slurm ignores -o/-l in structured mode; wrapper scripts set them
+        // unconditionally, so they must not be rejected.
+        let args = SqueueArgs::try_parse_from(["squeue", "-l", "-o", "%i", "--json"]).unwrap();
+        assert_eq!(
+            args.output.format().unwrap(),
+            crate::output::OutputFormat::Structured(crate::output::Encoding::Json)
+        );
+    }
+
+    #[test]
+    fn json_document_carries_the_queue_under_a_jobs_key() {
+        let jobs = vec![job(7, "gpu", P::JobRunning, 100)];
+        let doc = crate::output::render(
+            crate::output::Encoding::Json,
+            &["squeue".to_string()],
+            spur_api::JobsPayload::from_proto(&jobs),
+        )
+        .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&doc).unwrap();
+        assert_eq!(parsed["jobs"][0]["job_id"], 7);
+        assert_eq!(parsed["jobs"][0]["job_state"], "RUNNING");
+        assert_eq!(parsed["jobs"][0]["partition"], "gpu");
+    }
+
+    #[test]
+    fn text_rendering_emits_a_header_and_one_row_per_job() {
+        let args = SqueueArgs::try_parse_from(["squeue"]).unwrap();
+        let jobs = vec![
+            job(7, "gpu", P::JobRunning, 100),
+            job(8, "gpu", P::JobRunning, 100),
+        ];
+        let lines = render_text(&args, &jobs);
+        assert_eq!(lines.len(), 3);
+        assert!(lines[0].contains("JOBID"));
+        assert!(lines[1].contains('7'));
+        assert!(lines[2].contains('8'));
+    }
+
+    #[test]
+    fn noheader_drops_only_the_header_row() {
+        let args = SqueueArgs::try_parse_from(["squeue", "-h"]).unwrap();
+        let lines = render_text(&args, &[job(7, "gpu", P::JobRunning, 100)]);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains('7'));
+    }
+
+    #[test]
+    fn an_empty_queue_still_produces_a_jobs_array() {
+        let doc = crate::output::render(
+            crate::output::Encoding::Json,
+            &["squeue".to_string()],
+            spur_api::JobsPayload::from_proto(&[]),
+        )
+        .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&doc).unwrap();
+        assert_eq!(parsed["jobs"], serde_json::json!([]));
+    }
 
     #[test]
     fn sort_flag_accepts_hyphen_prefixed_value() {

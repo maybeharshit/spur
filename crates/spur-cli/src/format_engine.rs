@@ -225,15 +225,21 @@ fn format_field(value: &str, field: &FormatField) -> String {
     }
 }
 
-/// Print a header row followed by a separator line (dashes under text, spaces under spaces).
-pub fn print_header(tokens: &[FormatToken]) {
+/// A header row followed by a separator line (dashes under text, spaces under spaces).
+pub fn header_lines(tokens: &[FormatToken]) -> Vec<String> {
     let header = format_header(tokens);
     let sep: String = header
         .chars()
         .map(|c| if c == ' ' { ' ' } else { '-' })
         .collect();
-    println!("{header}");
-    println!("{sep}");
+    vec![header, sep]
+}
+
+/// Print a header row followed by a separator line.
+pub fn print_header(tokens: &[FormatToken]) {
+    for line in header_lines(tokens) {
+        println!("{line}");
+    }
 }
 
 /// Resolve a `format=` parameter into tokens.

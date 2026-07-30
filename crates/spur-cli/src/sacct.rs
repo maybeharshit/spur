@@ -3,10 +3,12 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use spur_api::JobsPayload;
 use spur_proto::proto::GetJobHistoryRequest;
 
 use crate::exit_fmt::format_exit;
 use crate::format_engine;
+use crate::output::{self, OutputArgs, OutputFormat};
 
 /// Display accounting data for jobs.
 #[derive(Parser, Debug)]
@@ -55,6 +57,9 @@ pub struct SacctArgs {
     /// Max records
     #[arg(long, default_value = "100")]
     pub limit: u32,
+
+    #[command(flatten)]
+    pub output: OutputArgs,
 
     /// Controller address (accounting is served on the same port)
     #[arg(
@@ -123,23 +128,13 @@ pub async fn main() -> Result<()> {
     main_with_args(std::env::args().collect()).await
 }
 
-pub async fn main_with_args(args: Vec<String>) -> Result<()> {
-    let args = SacctArgs::try_parse_from(&args)?;
+pub async fn main_with_args(argv: Vec<String>) -> Result<()> {
+    let args = SacctArgs::try_parse_from(&argv)?;
 
-    // -o/--format uses Slurm's comma-separated field-name syntax, not %-specifiers.
-    let fields = if let Some(ref f) = args.format {
-        let fields = format_engine::parse_named_format(f, &sacct_field_spec, &sacct_header);
-        if fields.is_empty() {
-            anyhow::bail!("sacct: no recognized fields in --format='{f}'");
-        }
-        fields
-    } else if args.long {
-        format_engine::parse_format(SACCT_LONG_FORMAT, &sacct_header)
-    } else if args.brief {
-        format_engine::parse_format(SACCT_BRIEF_FORMAT, &sacct_header)
-    } else {
-        format_engine::parse_format(SACCT_DEFAULT_FORMAT, &sacct_header)
-    };
+    let output_format = args.output.format()?;
+    // Resolved up front even in structured mode: an unrecognized field name is a
+    // typo worth reporting, and doing it here costs no round-trip.
+    let fields = resolve_fields(&args)?;
 
     // Parse state filter
     let states: Vec<i32> = args
@@ -170,8 +165,8 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
 
     let response = client
         .get_job_history(GetJobHistoryRequest {
-            user: args.user.unwrap_or_default(),
-            account: args.account.unwrap_or_default(),
+            user: args.user.clone().unwrap_or_default(),
+            account: args.account.clone().unwrap_or_default(),
             start_after,
             start_before,
             states,
@@ -182,16 +177,52 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
 
     let jobs = response.into_inner().jobs;
 
-    if !args.noheader {
-        format_engine::print_header(&fields);
+    if let OutputFormat::Structured(encoding) = output_format {
+        return output::emit(encoding, &argv, JobsPayload::from_proto(&jobs));
     }
 
-    for job in &jobs {
-        let row = format_engine::format_row(&fields, &|spec| resolve_sacct_field(job, spec));
-        println!("{}", row);
+    for line in render_text(&fields, args.noheader, &jobs) {
+        println!("{line}");
     }
 
     Ok(())
+}
+
+/// `-o`/`--format` uses Slurm's comma-separated field-name syntax, not
+/// %-specifiers. `-l` and `-b` select wider and narrower presets.
+fn resolve_fields(args: &SacctArgs) -> Result<Vec<format_engine::FormatToken>> {
+    let Some(ref f) = args.format else {
+        let preset = if args.long {
+            SACCT_LONG_FORMAT
+        } else if args.brief {
+            SACCT_BRIEF_FORMAT
+        } else {
+            SACCT_DEFAULT_FORMAT
+        };
+        return Ok(format_engine::parse_format(preset, &sacct_header));
+    };
+
+    let fields = format_engine::parse_named_format(f, &sacct_field_spec, &sacct_header);
+    if fields.is_empty() {
+        anyhow::bail!("sacct: no recognized fields in --format='{f}'");
+    }
+    Ok(fields)
+}
+
+fn render_text(
+    fields: &[format_engine::FormatToken],
+    noheader: bool,
+    jobs: &[spur_proto::proto::JobInfo],
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    if !noheader {
+        lines.extend(format_engine::header_lines(fields));
+    }
+    lines.extend(
+        jobs.iter()
+            .map(|job| format_engine::format_row(fields, &|spec| resolve_sacct_field(job, spec))),
+    );
+    lines
 }
 
 fn resolve_sacct_field(job: &spur_proto::proto::JobInfo, spec: char) -> String {
@@ -413,6 +444,70 @@ mod tests {
         assert!(row.contains("42"));
         assert!(row.contains("train"));
         assert!(row.contains("gpu"));
+    }
+
+    #[test]
+    fn structured_output_flags_are_accepted() {
+        let args = SacctArgs::try_parse_from(["sacct", "--json"]).unwrap();
+        assert_eq!(
+            args.output.format().unwrap(),
+            crate::output::OutputFormat::Structured(crate::output::Encoding::Json)
+        );
+
+        let args = SacctArgs::try_parse_from(["sacct", "--yaml"]).unwrap();
+        assert_eq!(
+            args.output.format().unwrap(),
+            crate::output::OutputFormat::Structured(crate::output::Encoding::Yaml)
+        );
+    }
+
+    #[test]
+    fn json_document_carries_history_under_a_jobs_key() {
+        let mut j = job(3, 9, 7);
+        j.job_id = 11;
+        j.state = JobState::JobCompleted as i32;
+        let doc = crate::output::render(
+            crate::output::Encoding::Json,
+            &["sacct".to_string()],
+            spur_api::JobsPayload::from_proto(&[j]),
+        )
+        .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&doc).unwrap();
+        assert_eq!(parsed["jobs"][0]["job_id"], 11);
+        assert_eq!(parsed["jobs"][0]["job_state"], "COMPLETED");
+        assert_eq!(parsed["jobs"][0]["exit_code"], 3);
+        assert_eq!(parsed["jobs"][0]["derived_exit_code"], 7);
+    }
+
+    #[test]
+    fn text_rendering_emits_a_header_and_separator_above_the_rows() {
+        let args = SacctArgs::try_parse_from(["sacct"]).unwrap();
+        let fields = resolve_fields(&args).unwrap();
+        let lines = render_text(&fields, false, &[job(0, 0, 0)]);
+        assert_eq!(lines.len(), 3);
+        assert!(lines[0].contains("JobID"));
+        assert!(lines[1].contains("---"));
+    }
+
+    #[test]
+    fn noheader_drops_the_header_and_its_separator() {
+        let args = SacctArgs::try_parse_from(["sacct"]).unwrap();
+        let fields = resolve_fields(&args).unwrap();
+        let lines = render_text(&fields, true, &[job(0, 0, 0)]);
+        assert_eq!(lines.len(), 1);
+    }
+
+    #[test]
+    fn brief_and_long_presets_select_different_column_counts() {
+        let brief = resolve_fields(&SacctArgs::try_parse_from(["sacct", "-b"]).unwrap()).unwrap();
+        let long = resolve_fields(&SacctArgs::try_parse_from(["sacct", "-l"]).unwrap()).unwrap();
+        let count = |fields: &[format_engine::FormatToken]| {
+            fields
+                .iter()
+                .filter(|t| matches!(t, format_engine::FormatToken::Field(_)))
+                .count()
+        };
+        assert!(count(&brief) < count(&long));
     }
 
     #[tokio::test]

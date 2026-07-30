@@ -5,9 +5,11 @@ use std::collections::BTreeMap;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use spur_api::ClusterPayload;
 use spur_proto::proto::{GetNodesRequest, GetPartitionsRequest, NodeInfo, PartitionInfo};
 
 use crate::format_engine;
+use crate::output::{self, OutputArgs, OutputFormat};
 
 /// View information about nodes and partitions.
 #[derive(Parser, Debug)]
@@ -45,6 +47,9 @@ pub struct SinfoArgs {
     #[arg(short = 'h', long)]
     pub noheader: bool,
 
+    #[command(flatten)]
+    pub output: OutputArgs,
+
     /// Controller address
     #[arg(
         long,
@@ -62,22 +67,12 @@ pub async fn main() -> Result<()> {
     main_with_args(std::env::args().collect()).await
 }
 
-pub async fn main_with_args(args: Vec<String>) -> Result<()> {
-    let args = SinfoArgs::try_parse_from(&args)?;
+pub async fn main_with_args(argv: Vec<String>) -> Result<()> {
+    let args = SinfoArgs::try_parse_from(&argv)?;
 
-    let fmt = if let Some(ref f) = args.format {
-        f.clone()
-    } else if args.long {
-        "%#P %5a %.10l %.4D %.6t %.8c %.8m %N".to_string()
-    } else if args.node_oriented {
-        "%#N %.6D %#P %.11T %.4c %.8m %G".to_string()
-    } else {
-        format_engine::SINFO_DEFAULT_FORMAT.to_string()
-    };
-
-    let fields = format_engine::parse_format(&fmt, &format_engine::sinfo_header);
-
-    // Built before connecting so an invalid `-t` fails without a round-trip.
+    // Resolved before connecting so an invalid `-t` or `--json` fails without a
+    // round-trip.
+    let format = args.output.format()?;
     let nodes_req = build_get_nodes_request(&args)?;
 
     let channel = spur_client::connect_channel(&args.controller)
@@ -103,15 +98,46 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
 
     let nodes = nodes_resp.into_inner().nodes;
 
-    // Print header
-    if !args.noheader {
-        println!("{}", format_engine::format_header(&fields));
+    if let OutputFormat::Structured(encoding) = format {
+        return output::emit(
+            encoding,
+            &argv,
+            ClusterPayload::from_proto(&nodes, &partitions),
+        );
     }
-    for line in render_sinfo_output(&fields, &partitions, &nodes, args.node_oriented) {
-        println!("{}", line);
+
+    for line in render_text(&args, &partitions, &nodes) {
+        println!("{line}");
     }
 
     Ok(())
+}
+
+/// The column header (unless suppressed) followed by the partition- or
+/// node-oriented rows.
+fn render_text(args: &SinfoArgs, partitions: &[PartitionInfo], nodes: &[NodeInfo]) -> Vec<String> {
+    let fmt = if let Some(ref f) = args.format {
+        f.clone()
+    } else if args.long {
+        "%#P %5a %.10l %.4D %.6t %.8c %.8m %N".to_string()
+    } else if args.node_oriented {
+        "%#N %.6D %#P %.11T %.4c %.8m %G".to_string()
+    } else {
+        format_engine::SINFO_DEFAULT_FORMAT.to_string()
+    };
+    let fields = format_engine::parse_format(&fmt, &format_engine::sinfo_header);
+
+    let mut lines = Vec::new();
+    if !args.noheader {
+        lines.push(format_engine::format_header(&fields));
+    }
+    lines.extend(render_sinfo_output(
+        &fields,
+        partitions,
+        nodes,
+        args.node_oriented,
+    ));
+    lines
 }
 
 fn build_get_nodes_request(args: &SinfoArgs) -> Result<GetNodesRequest> {
@@ -361,6 +387,67 @@ mod tests {
             format_engine::SINFO_DEFAULT_FORMAT,
             &format_engine::sinfo_header,
         )
+    }
+
+    // --- structured output tests ---
+
+    #[test]
+    fn structured_output_flags_are_accepted() {
+        let args = SinfoArgs::try_parse_from(["sinfo", "--json"]).unwrap();
+        assert_eq!(
+            args.output.format().unwrap(),
+            crate::output::OutputFormat::Structured(crate::output::Encoding::Json)
+        );
+
+        let args = SinfoArgs::try_parse_from(["sinfo", "--yaml"]).unwrap();
+        assert_eq!(
+            args.output.format().unwrap(),
+            crate::output::OutputFormat::Structured(crate::output::Encoding::Yaml)
+        );
+    }
+
+    #[test]
+    fn json_document_carries_both_nodes_and_partitions() {
+        let nodes = vec![make_node("node01", NodeState::NodeIdle, "gpu")];
+        let partitions = vec![make_partition("gpu", true)];
+        let doc = crate::output::render(
+            crate::output::Encoding::Json,
+            &["sinfo".to_string()],
+            ClusterPayload::from_proto(&nodes, &partitions),
+        )
+        .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&doc).unwrap();
+        assert_eq!(parsed["nodes"][0]["name"], "node01");
+        assert_eq!(parsed["nodes"][0]["state"], "idle");
+        assert_eq!(parsed["partitions"][0]["name"], "gpu");
+        assert_eq!(parsed["partitions"][0]["is_default"], true);
+    }
+
+    #[test]
+    fn text_rendering_emits_a_header_above_the_partition_rows() {
+        let args = SinfoArgs::try_parse_from(["sinfo"]).unwrap();
+        let nodes = vec![make_node("node01", NodeState::NodeIdle, "gpu")];
+        let partitions = vec![make_partition("gpu", true)];
+        let lines = render_text(&args, &partitions, &nodes);
+        assert!(lines[0].contains("PARTITION"));
+        assert!(lines[1].contains("gpu*"));
+    }
+
+    #[test]
+    fn noheader_drops_only_the_header_row() {
+        let nodes = vec![make_node("node01", NodeState::NodeIdle, "gpu")];
+        let partitions = vec![make_partition("gpu", true)];
+        let with_header = render_text(
+            &SinfoArgs::try_parse_from(["sinfo"]).unwrap(),
+            &partitions,
+            &nodes,
+        );
+        let without = render_text(
+            &SinfoArgs::try_parse_from(["sinfo", "-h"]).unwrap(),
+            &partitions,
+            &nodes,
+        );
+        assert_eq!(without.len(), with_header.len() - 1);
     }
 
     // --- state filter plumbing tests ---
