@@ -2221,7 +2221,7 @@ fn proto_to_resource_set(r: spur_proto::proto::ResourceSet) -> spur_core::resour
     }
 }
 
-fn job_to_proto(job: &spur_core::job::Job) -> JobInfo {
+pub(crate) fn job_to_proto(job: &spur_core::job::Job) -> JobInfo {
     use spur_core::hostlist;
 
     JobInfo {
@@ -2321,7 +2321,7 @@ fn requested_gpus_detail(spec: &spur_core::job::JobSpec) -> String {
     }
 }
 
-fn node_to_proto(node: &spur_core::node::Node) -> NodeInfo {
+pub(crate) fn node_to_proto(node: &spur_core::node::Node) -> NodeInfo {
     NodeInfo {
         name: node.name.clone(),
         state: node.state.to_proto_i32(),
@@ -2344,7 +2344,7 @@ fn node_to_proto(node: &spur_core::node::Node) -> NodeInfo {
     }
 }
 
-fn partition_to_proto(part: &spur_core::partition::Partition) -> PartitionInfo {
+pub(crate) fn partition_to_proto(part: &spur_core::partition::Partition) -> PartitionInfo {
     PartitionInfo {
         name: part.name.clone(),
         state: part.state.display().to_string(),

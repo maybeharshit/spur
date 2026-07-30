@@ -5,10 +5,12 @@ use std::sync::Arc;
 
 use axum::extract::{Path, Query, State};
 use axum::response::Json;
+use spur_api::{JobsPayload, NodesPayload, PartitionsPayload};
 
-use super::convert::{job_to_json, node_to_json, parse_states_query, partition_to_json};
+use super::convert::parse_states_query;
 use super::types::*;
 use super::RestState;
+use crate::server::{job_to_proto, node_to_proto, partition_to_proto};
 
 pub async fn ping(
     State(state): State<Arc<RestState>>,
@@ -17,7 +19,7 @@ pub async fn ping(
         .map(|h| h.to_string_lossy().to_string())
         .unwrap_or_else(|_| "unknown".into());
 
-    Ok(ApiResponse::ok(PingData {
+    Ok(ok(PingData {
         ping: vec![PingInfo {
             hostname,
             pinged: "UP".into(),
@@ -35,7 +37,7 @@ pub async fn ping(
 pub async fn get_jobs(
     State(state): State<Arc<RestState>>,
     Query(query): Query<JobsQuery>,
-) -> Result<Json<ApiResponse<JobsData>>, RestError> {
+) -> Result<Json<ApiResponse<JobsPayload>>, RestError> {
     let states = match query.state.as_deref() {
         Some(s) => parse_states_query(s).map_err(|e| bad_request_response(&e))?,
         None => Vec::new(),
@@ -49,23 +51,21 @@ pub async fn get_jobs(
     let jobs = state
         .cluster
         .get_jobs(&states, user, partition, account, name, &[]);
-    let json_jobs: Vec<serde_json::Value> = jobs.iter().map(job_to_json).collect();
+    let protos: Vec<_> = jobs.iter().map(job_to_proto).collect();
 
-    Ok(ApiResponse::ok(JobsData { jobs: json_jobs }))
+    Ok(ok(JobsPayload::from_proto(&protos)))
 }
 
 pub async fn get_job(
     State(state): State<Arc<RestState>>,
     Path(job_id): Path<u32>,
-) -> Result<Json<ApiResponse<JobsData>>, RestError> {
+) -> Result<Json<ApiResponse<JobsPayload>>, RestError> {
     let job = state
         .cluster
         .get_job_for_display(job_id)
         .ok_or_else(|| not_found_response(&format!("job {job_id} not found")))?;
 
-    Ok(ApiResponse::ok(JobsData {
-        jobs: vec![job_to_json(&job)],
-    }))
+    Ok(ok(JobsPayload::from_proto(&[job_to_proto(&job)])))
 }
 
 pub async fn submit_job(
@@ -107,7 +107,7 @@ pub async fn submit_job(
 
     let job_id = state.cluster.submit_job(spec).map_err(submit_rest_error)?;
 
-    Ok(ApiResponse::ok(SubmitResponse { job_id }))
+    Ok(ok(SubmitResponse { job_id }))
 }
 
 /// Parse a REST GPU field ("4" or "mi300x:4") into a core GPU request.
@@ -151,41 +151,37 @@ pub async fn cancel_job(
         });
     }
 
-    Ok(ApiResponse::ok(serde_json::json!({})))
+    Ok(ok(serde_json::json!({})))
 }
 
 pub async fn get_nodes(
     State(state): State<Arc<RestState>>,
-) -> Result<Json<ApiResponse<NodesData>>, RestError> {
+) -> Result<Json<ApiResponse<NodesPayload>>, RestError> {
     let nodes = state.cluster.get_nodes();
-    let json_nodes: Vec<serde_json::Value> = nodes.iter().map(node_to_json).collect();
+    let protos: Vec<_> = nodes.iter().map(node_to_proto).collect();
 
-    Ok(ApiResponse::ok(NodesData { nodes: json_nodes }))
+    Ok(ok(NodesPayload::from_proto(&protos)))
 }
 
 pub async fn get_node(
     State(state): State<Arc<RestState>>,
     Path(name): Path<String>,
-) -> Result<Json<ApiResponse<NodesData>>, RestError> {
+) -> Result<Json<ApiResponse<NodesPayload>>, RestError> {
     let node = state
         .cluster
         .get_node(&name)
         .ok_or_else(|| not_found_response(&format!("node {name} not found")))?;
 
-    Ok(ApiResponse::ok(NodesData {
-        nodes: vec![node_to_json(&node)],
-    }))
+    Ok(ok(NodesPayload::from_proto(&[node_to_proto(&node)])))
 }
 
 pub async fn get_partitions(
     State(state): State<Arc<RestState>>,
-) -> Result<Json<ApiResponse<PartitionsData>>, RestError> {
+) -> Result<Json<ApiResponse<PartitionsPayload>>, RestError> {
     let partitions = state.cluster.get_partitions();
-    let json_parts: Vec<serde_json::Value> = partitions.iter().map(partition_to_json).collect();
+    let protos: Vec<_> = partitions.iter().map(partition_to_proto).collect();
 
-    Ok(ApiResponse::ok(PartitionsData {
-        partitions: json_parts,
-    }))
+    Ok(ok(PartitionsPayload::from_proto(&protos)))
 }
 
 #[cfg(test)]

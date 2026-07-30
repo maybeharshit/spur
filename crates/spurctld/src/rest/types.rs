@@ -1,70 +1,22 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+//! HTTP-specific glue around the shared [`spur_api`] schema.
+//!
+//! The envelope and entity views live in `spur-api` so the CLI's `--json` and
+//! `--yaml` modes emit the same documents these handlers do. Only the Axum
+//! wrapping and the request bodies are local.
+
 use axum::http::StatusCode;
 use axum::response::Json;
 use serde::{Deserialize, Serialize};
+use spur_api::{ApiError, Envelope};
 use std::collections::HashMap;
 
-#[derive(Serialize)]
-pub struct ApiResponse<T: Serialize> {
-    pub meta: ApiMeta,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub errors: Vec<ApiError>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub warnings: Vec<String>,
-    #[serde(flatten)]
-    pub data: T,
-}
+pub type ApiResponse<T> = Envelope<T>;
 
-#[derive(Serialize)]
-pub struct ApiMeta {
-    #[serde(rename = "Slurm")]
-    pub slurm: ApiVersion,
-}
-
-#[derive(Serialize)]
-pub struct ApiVersion {
-    pub version: ApiVersionInfo,
-    pub release: String,
-}
-
-#[derive(Serialize)]
-pub struct ApiVersionInfo {
-    pub major: u32,
-    pub minor: u32,
-    pub micro: u32,
-}
-
-#[derive(Serialize)]
-pub struct ApiError {
-    pub error: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error_number: Option<i32>,
-}
-
-pub fn meta() -> ApiMeta {
-    ApiMeta {
-        slurm: ApiVersion {
-            version: ApiVersionInfo {
-                major: 0,
-                minor: 0,
-                micro: 42,
-            },
-            release: "spur 0.1.0".into(),
-        },
-    }
-}
-
-impl<T: Serialize> ApiResponse<T> {
-    pub fn ok(data: T) -> Json<Self> {
-        Json(Self {
-            meta: meta(),
-            errors: Vec::new(),
-            warnings: Vec::new(),
-            data,
-        })
-    }
+pub fn ok<T: Serialize>(data: T) -> Json<ApiResponse<T>> {
+    Json(Envelope::new(data))
 }
 
 pub type RestError = (StatusCode, Json<ApiResponse<serde_json::Value>>);
@@ -88,15 +40,7 @@ pub fn unavailable_response(msg: &str) -> RestError {
 pub fn api_error_response(status: StatusCode, msg: &str) -> RestError {
     (
         status,
-        Json(ApiResponse {
-            meta: meta(),
-            errors: vec![ApiError {
-                error: msg.to_string(),
-                error_number: None,
-            }],
-            warnings: Vec::new(),
-            data: serde_json::json!({}),
-        }),
+        Json(Envelope::new(serde_json::json!({})).with_errors(vec![ApiError::new(msg)])),
     )
 }
 
@@ -122,21 +66,6 @@ pub struct JobsQuery {
     pub state: Option<String>,
     pub account: Option<String>,
     pub name: Option<String>,
-}
-
-#[derive(Serialize)]
-pub struct JobsData {
-    pub jobs: Vec<serde_json::Value>,
-}
-
-#[derive(Serialize)]
-pub struct NodesData {
-    pub nodes: Vec<serde_json::Value>,
-}
-
-#[derive(Serialize)]
-pub struct PartitionsData {
-    pub partitions: Vec<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -180,5 +109,14 @@ mod tests {
             serde_json::from_str(r#"{"job":{"user":"alice","account":"research"}}"#).unwrap();
         assert_eq!(body.job.user.as_deref(), Some("alice"));
         assert_eq!(body.job.account.as_deref(), Some("research"));
+    }
+
+    #[test]
+    fn error_responses_carry_the_message_in_the_envelope() {
+        let (status, Json(envelope)) = bad_request_response("bad state");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let doc = serde_json::to_value(&envelope).unwrap();
+        assert_eq!(doc["errors"][0]["error"], "bad state");
+        assert!(doc.get("meta").is_some());
     }
 }
